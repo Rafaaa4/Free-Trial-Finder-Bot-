@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
+from telegram.error import Conflict
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -408,7 +409,13 @@ async def reply_long(update: Update, text: str):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    LOGGER.exception("Bot error: %s", context.error)
+    error = context.error
+    if isinstance(error, Conflict):
+        LOGGER.error("Telegram conflict (another instance is polling). Stopping this instance.")
+        context.application.stop_running()
+        return
+
+    LOGGER.error("Bot error: %s", error, exc_info=error)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
