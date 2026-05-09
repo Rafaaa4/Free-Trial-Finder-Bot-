@@ -14,6 +14,7 @@ env/
 
 # Logs
 *.log
+.bot.lock
 
 # OS
 .DS_Store
