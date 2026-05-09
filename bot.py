@@ -1,32 +1,23 @@
 import asyncio
 import json
+import logging
 import os
 import re
-import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-try:
-    from ddgs import DDGS
-
-    USING_LEGACY_DDGS = False
-except ImportError:
-    from duckduckgo_search import DDGS
-
-    USING_LEGACY_DDGS = True
-
 TOKEN_PATTERN = re.compile(r"^\d{6,}:[A-Za-z0-9_-]{20,}$")
+LOGGER = logging.getLogger(__name__)
 
 ENV_FILE = ".env"
 PLATFORMS_FILE = "platforms.json"
 OFFICIAL_DOMAINS_FILE = "official_domains.json"
 
-SEARCH_MAX_RESULTS = 8
 MAX_PLATFORM_RESULTS = 5
 MAX_SCAN_RESULTS = 20
 REQUEST_TIMEOUT = 12
@@ -48,14 +39,14 @@ DEFAULT_PLATFORMS = [
 ]
 
 DEFAULT_OFFICIAL_DOMAINS = {
-    "Canva": ["canva.com"],
-    "Spotify": ["spotify.com"],
-    "Adobe": ["adobe.com"],
-    "Figma": ["figma.com"],
-    "Notion": ["notion.so", "notion.com"],
-    "ChatGPT": ["openai.com", "chatgpt.com"],
-    "GitHub Copilot": ["github.com"],
-    "Cursor AI": ["cursor.com", "cursor.sh"],
+    "Canva": "https://www.canva.com/pricing/",
+    "Spotify": "https://www.spotify.com/premium/",
+    "Adobe": "https://www.adobe.com/creativecloud/plans.html",
+    "Figma": "https://www.figma.com/pricing/",
+    "Notion": "https://www.notion.so/pricing",
+    "ChatGPT": "https://openai.com/chatgpt/pricing/",
+    "GitHub Copilot": "https://github.com/features/copilot/plans",
+    "Cursor AI": "https://cursor.com/pricing",
 }
 
 PATTERNS = [
@@ -81,85 +72,10 @@ PATTERNS = [
 
 COMPILED_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in PATTERNS]
 
-URL_HINTS = (
-    "pricing",
-    "plans",
-    "plan",
-    "billing",
-    "subscription",
-    "trial",
-    "student",
-    "education",
-    "free",
-)
-
-NEGATIVE_HINTS = (
-    "review",
-    "coupon",
-    "promo code",
-    "reddit",
-    "forum",
-    "torrent",
-    "crack",
-    "mod apk",
-)
-
-LOW_TRUST_DOMAINS = {
-    "reddit.com",
-    "youtube.com",
-    "x.com",
-    "twitter.com",
-    "facebook.com",
-    "instagram.com",
-    "tiktok.com",
-    "quora.com",
-    "pinterest.com",
-    "medium.com",
-    "linkedin.com",
-    "wikipedia.org",
-}
-
-TRACKING_QUERY_KEYS = {
-    "utm_source",
-    "utm_medium",
-    "utm_campaign",
-    "utm_term",
-    "utm_content",
-    "gclid",
-    "fbclid",
-    "ref",
-    "ref_src",
-    "source",
-}
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Accept-Language": "en-US,en;q=0.9",
 }
-
-
-def build_ddgs_client():
-    def _create_client():
-        try:
-            return DDGS(verify=False)
-        except TypeError:
-            return DDGS()
-
-    if not USING_LEGACY_DDGS:
-        return _create_client()
-
-    original_warn = warnings.warn
-
-    def _patched_warn(message, *args, **kwargs):
-        if isinstance(message, str) and "renamed to `ddgs`" in message:
-            return None
-        return original_warn(message, *args, **kwargs)
-
-    warnings.warn = _patched_warn
-    try:
-        return _create_client()
-    finally:
-        warnings.warn = original_warn
 
 
 def load_local_env(path=ENV_FILE):
@@ -227,6 +143,20 @@ def normalize_domain(value):
     return domain
 
 
+def normalize_url(value):
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+
+    split = urlsplit(raw)
+    if split.scheme not in ("http", "https") or not split.netloc:
+        return ""
+    return raw
+
+
 def save_official_domains(domains_map):
     with open(OFFICIAL_DOMAINS_FILE, "w", encoding="utf-8") as f:
         json.dump(domains_map, f, indent=2, ensure_ascii=False)
@@ -234,8 +164,8 @@ def save_official_domains(domains_map):
 
 def load_official_domains():
     normalized_defaults = {
-        platform.lower(): [normalize_domain(item) for item in domains]
-        for platform, domains in DEFAULT_OFFICIAL_DOMAINS.items()
+        platform.lower(): normalize_url(url)
+        for platform, url in DEFAULT_OFFICIAL_DOMAINS.items()
     }
 
     try:
@@ -246,20 +176,22 @@ def load_official_domains():
             raise ValueError("official domains file must be an object")
 
         loaded = {}
-        for platform, domains in raw_data.items():
-            if isinstance(domains, str):
-                domains = [domains]
-            if not isinstance(domains, list):
+        for platform, value in raw_data.items():
+            key = str(platform).strip().lower()
+            if not key:
                 continue
 
-            normalized_list = []
-            for domain in domains:
-                item = normalize_domain(str(domain))
-                if item and item not in normalized_list:
-                    normalized_list.append(item)
+            if isinstance(value, str):
+                url = normalize_url(value)
+                if url:
+                    loaded[key] = url
+                continue
 
-            if normalized_list:
-                loaded[str(platform).strip().lower()] = normalized_list
+            if isinstance(value, list) and value:
+                # Backward compatibility: old format may contain domains list.
+                first_domain = normalize_domain(str(value[0]))
+                if first_domain:
+                    loaded[key] = f"https://{first_domain}"
 
         merged = dict(normalized_defaults)
         merged.update(loaded)
@@ -273,95 +205,8 @@ def normalize_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def canonicalize_url(url):
-    try:
-        split = urlsplit((url or "").strip())
-        if split.scheme not in ("http", "https") or not split.netloc:
-            return ""
-
-        query_pairs = parse_qsl(split.query, keep_blank_values=True)
-        filtered_query = [
-            (k, v)
-            for k, v in query_pairs
-            if not k.lower().startswith("utm_") and k.lower() not in TRACKING_QUERY_KEYS
-        ]
-
-        query = urlencode(filtered_query, doseq=True)
-        path = split.path.rstrip("/") or split.path
-        return urlunsplit((split.scheme.lower(), split.netloc.lower(), path, query, ""))
-    except Exception:
-        return ""
-
-
-def get_domain(url):
-    netloc = urlsplit(url).netloc.lower()
-    if netloc.startswith("www."):
-        return netloc[4:]
-    return netloc
-
-
-def get_platform_whitelist(platform, official_domains_map):
-    return official_domains_map.get(platform.lower(), [])
-
-
-def domain_in_whitelist(domain, whitelist):
-    return any(domain == allowed or domain.endswith(f".{allowed}") for allowed in whitelist)
-
-
-def build_search_query(platform, whitelist):
-    base = f'{platform} official pricing free trial "$0" "months free"'
-    if not whitelist:
-        return base
-
-    site_filter = " OR ".join([f"site:{domain}" for domain in whitelist])
-    return f"{base} ({site_filter})"
-
-
-def is_low_trust_domain(domain):
-    return any(domain == item or domain.endswith(f".{item}") for item in LOW_TRUST_DOMAINS)
-
-
-def platform_tokens(platform):
-    return [token for token in re.findall(r"[a-z0-9]+", platform.lower()) if len(token) > 2]
-
-
-def looks_official_for_platform(platform, domain):
-    return any(token in domain for token in platform_tokens(platform))
-
-
-def score_result(platform, url, title, body, offer, whitelist):
-    score = 0
-    domain = get_domain(url)
-    path = urlsplit(url).path.lower()
-    search_text = f"{title} {body}".lower()
-    source = "community"
-
-    if whitelist and domain_in_whitelist(domain, whitelist):
-        score += 8
-        source = "official"
-    elif looks_official_for_platform(platform, domain):
-        score += 4
-        source = "official-ish"
-
-    if any(hint in path for hint in URL_HINTS):
-        score += 2
-
-    if any(hint in search_text for hint in URL_HINTS):
-        score += 1
-
-    if any(hint in search_text for hint in NEGATIVE_HINTS):
-        score -= 2
-
-    if is_low_trust_domain(domain):
-        score -= 3
-
-    offer_text = offer.lower()
-    if any(term in offer_text for term in ("trial", "day", "week", "month", "year")):
-        score += 2
-    elif "free" in offer_text or "student" in offer_text:
-        score += 1
-
-    return score, source
+def get_platform_source_url(platform, official_domains_map):
+    return official_domains_map.get(platform.lower(), "")
 
 
 def extract_offer_info(text):
@@ -378,18 +223,45 @@ def extract_offer_info(text):
     return None, None
 
 
+def extract_offer_matches(text):
+    matches = []
+    seen = set()
+
+    for pattern in COMPILED_PATTERNS:
+        match = pattern.search(text)
+        if not match:
+            continue
+
+        offer = normalize_text(match.group(0))
+        key = offer.lower()
+        if not offer or key in seen:
+            continue
+        seen.add(key)
+
+        start = max(match.start() - SNIPPET_WINDOW, 0)
+        end = min(match.end() + SNIPPET_WINDOW, len(text))
+        snippet = normalize_text(text[start:end])
+        matches.append((offer, snippet))
+
+    return matches
+
+
 def fetch_page_text(url):
     try:
-        res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        try:
+            res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        except requests.exceptions.SSLError:
+            res = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, verify=False)
         content_type = res.headers.get("Content-Type", "").lower()
         if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return ""
+            return "", ""
 
         soup = BeautifulSoup(res.text, "html.parser")
+        title = normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
         text = normalize_text(soup.get_text(" ", strip=True))
-        return text[:MAX_PAGE_CHARS]
+        return title, text[:MAX_PAGE_CHARS]
     except Exception:
-        return ""
+        return "", ""
 
 
 def dedupe_and_sort(results):
@@ -415,56 +287,28 @@ def scan_platform(platform, official_domains_map=None):
     if official_domains_map is None:
         official_domains_map = load_official_domains()
 
-    whitelist = get_platform_whitelist(platform, official_domains_map)
-    query = build_search_query(platform, whitelist)
+    url = get_platform_source_url(platform, official_domains_map)
+    if not url:
+        return []
+
     found = []
 
-    try:
-        with build_ddgs_client() as ddgs:
-            results = ddgs.text(
-                query,
-                region="us-en",
-                safesearch="moderate",
-                max_results=SEARCH_MAX_RESULTS,
-            )
-            results = list(results)
-    except Exception:
+    title, page_text = fetch_page_text(url)
+    if not page_text:
         return found
 
-    for item in results:
-        url = canonicalize_url(item.get("href", ""))
-        title = normalize_text(item.get("title", ""))
-        body = normalize_text(item.get("body", ""))
-        search_text = f"{title} {body}"
-
-        if not url:
-            continue
-
-        domain = get_domain(url)
-        if whitelist and not domain_in_whitelist(domain, whitelist):
-            continue
-
-        offer, snippet = extract_offer_info(search_text)
-        if not offer:
-            page_text = fetch_page_text(url)
-            candidate_text = page_text if page_text else body
-            if not candidate_text:
-                continue
-
-            offer, snippet = extract_offer_info(candidate_text)
-            if not offer:
-                continue
-
-        score, source = score_result(platform, url, title, body, offer, whitelist)
+    search_text = f"{title} {page_text}"
+    matched = extract_offer_matches(search_text)
+    for offer, snippet in matched:
         found.append(
             {
                 "platform": platform,
-                "title": title,
+                "title": title or f"{platform} pricing",
                 "offer": offer,
                 "url": url,
                 "snippet": snippet,
-                "score": score,
-                "source": source,
+                "score": 100,
+                "source": "official",
             }
         )
 
@@ -563,6 +407,10 @@ async def reply_long(update: Update, text: str):
         await update.message.reply_text(text[i : i + MAX_TELEGRAM_MESSAGE])
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    LOGGER.exception("Bot error: %s", context.error)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(render_help_message())
 
@@ -625,9 +473,15 @@ async def scan_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        level=logging.INFO,
+    )
+
     token = get_bot_token()
     app = ApplicationBuilder().token(token).build()
 
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_platforms))
     app.add_handler(CommandHandler("help", help_command))
@@ -635,7 +489,7 @@ def main():
     app.add_handler(CommandHandler("check", check_platform))
     app.add_handler(CommandHandler("scan", scan_all))
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, bootstrap_retries=0)
 
 
 if __name__ == "__main__":
