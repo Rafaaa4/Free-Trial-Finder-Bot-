@@ -58,17 +58,28 @@ DEFAULT_OFFICIAL_DOMAINS = {
     "Cursor AI": ["cursor.com", "cursor.sh"],
 }
 
-OFFER_PATTERNS = [
-    re.compile(
-        r"\b\d{1,2}\s*(?:day|days|week|weeks|month|months|year|years)\s*(?:free|trial)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\bfree\s*(?:trial|plan|tier)\b", re.IGNORECASE),
-    re.compile(r"\b(?:student|education|academic)\s*(?:discount|plan|pricing|offer)\b", re.IGNORECASE),
-    re.compile(r"\bno\s*credit\s*card\b", re.IGNORECASE),
-    re.compile(r"\b\$?\s*0(?:\.0{1,2})?\b", re.IGNORECASE),
-    re.compile(r"\btry\s+for\s+free\b", re.IGNORECASE),
+PATTERNS = [
+    r"free trial",
+    r"try.*free",
+    r"start.*free",
+    r"free for \d+ days",
+    r"free for \d+ months",
+    r"\d+\s*days?\s*free",
+    r"\d+\s*months?\s*free",
+    r"1\s*month\s*free",
+    r"3\s*months?\s*free",
+    r"30\s*days?\s*free",
+    r"90\s*days?\s*free",
+    r"\$0",
+    r"0\s*\$",
+    r"free plan",
+    r"student plan",
+    r"student discount",
+    r"no credit card required",
+    r"free version",
 ]
+
+COMPILED_PATTERNS = [re.compile(pattern, re.IGNORECASE) for pattern in PATTERNS]
 
 URL_HINTS = (
     "pricing",
@@ -298,7 +309,7 @@ def domain_in_whitelist(domain, whitelist):
 
 
 def build_search_query(platform, whitelist):
-    base = f'"{platform}" (pricing OR plans) ("free trial" OR "free plan" OR "student discount")'
+    base = f'{platform} official pricing free trial "$0" "months free"'
     if not whitelist:
         return base
 
@@ -354,7 +365,7 @@ def score_result(platform, url, title, body, offer, whitelist):
 
 
 def extract_offer_info(text):
-    for pattern in OFFER_PATTERNS:
+    for pattern in COMPILED_PATTERNS:
         match = pattern.search(text)
         if not match:
             continue
@@ -424,6 +435,7 @@ def scan_platform(platform, official_domains_map=None):
         url = canonicalize_url(item.get("href", ""))
         title = normalize_text(item.get("title", ""))
         body = normalize_text(item.get("body", ""))
+        search_text = f"{title} {body}"
 
         if not url:
             continue
@@ -432,14 +444,16 @@ def scan_platform(platform, official_domains_map=None):
         if whitelist and not domain_in_whitelist(domain, whitelist):
             continue
 
-        page_text = fetch_page_text(url)
-        candidate_text = page_text if page_text else body
-        if not candidate_text:
-            continue
-
-        offer, snippet = extract_offer_info(candidate_text)
+        offer, snippet = extract_offer_info(search_text)
         if not offer:
-            continue
+            page_text = fetch_page_text(url)
+            candidate_text = page_text if page_text else body
+            if not candidate_text:
+                continue
+
+            offer, snippet = extract_offer_info(candidate_text)
+            if not offer:
+                continue
 
         score, source = score_result(platform, url, title, body, offer, whitelist)
         found.append(
