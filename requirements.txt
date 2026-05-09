@@ -1,0 +1,5 @@
+python-telegram-bot
+duckduckgo-search
+beautifulsoup4
+requests
+pandas
